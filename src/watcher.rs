@@ -42,7 +42,7 @@ use futures::{StreamExt, TryStreamExt};
 use libc::FAN_CLOSE_WRITE;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::{self, Receiver, Sender};
-use tracing::{debug, instrument, trace};
+use tracing::{debug, instrument, trace, warn};
 
 use crate::fs::{TargetDir, ThrottledFs, XmpFile};
 use crate::immich::ImmichSync;
@@ -156,15 +156,21 @@ pub async fn handle_event<Exporter: ImageExporter>(
     debug!("Got relevant file event");
 
     let xmp_file = event.xmp_file;
-    let Some(xmp) = Xmp::read_from_file(&xmp_file, fs)
-        .await
-        .map(Some)
-        .ignore_err_if(|e| matches!(e, XmpError::NotFound(_)), None)
-        .wrap_err("Could not read xmp file")
-        .note_path(&xmp_file)?
-    else {
-        debug!("xmp file in event did not exist, probably already deleted: skipping");
-        return Ok(());
+    let xmp = match Xmp::read_from_file(&xmp_file, fs).await {
+        Ok(xmp) => xmp,
+        Err(XmpError::NotFound(_)) => {
+            debug!("xmp file in event did not exist, probably already deleted: skipping");
+            return Ok(());
+        }
+        Err(e @ XmpError::IncompleteFile) => {
+            warn!("could not read xmp file in response to event: {e}");
+            return Ok(());
+        }
+        Err(other) => {
+            return Err(other)
+                .wrap_err("Could not read xmp file")
+                .note_path(&xmp_file);
+        }
     };
     let preview = xmp_file.preview_path(base_source, base_target);
     let target = preview.dir();

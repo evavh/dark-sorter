@@ -4,11 +4,11 @@ use std::io::ErrorKind;
 use color_eyre::eyre::{Context, OptionExt};
 use futures::TryStreamExt;
 use futures::stream::FuturesUnordered;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 use crate::fs::{PreviewFile, SourceDir, TargetDir, ThrottledFs, XmpFile};
 use crate::watcher::{EyreWithPath, ResultExt};
-use crate::xmp::{ParsedXmps, Xmp};
+use crate::xmp::{ParsedXmps, Xmp, XmpError};
 use crate::{ImageExporter, database, xmp};
 
 #[instrument(skip_all, fields(preview=?preview, source_dir=?source_dir))]
@@ -27,6 +27,10 @@ pub async fn should_remove(
         Ok(xmp) => xmp,
         Err(xmp::XmpError::NotFound(_)) => {
             debug!("No known xmp corresponding with preview");
+            return Ok(true);
+        }
+        Err(e @ xmp::XmpError::IncompleteFile) => {
+            warn!("Error checking if we should remove file: {e}");
             return Ok(true);
         }
         Err(e) => return Err(e).wrap_err("Could not read xmp"),
@@ -74,16 +78,24 @@ pub(crate) async fn create_update_or_clean<Exporter: ImageExporter>(
         .iter()
         .cloned()
         .map(|xmp_file| async move {
-            let xmp = xmps.cached_or_parse_from(&xmp_file, fs).await?;
-            create_update_or_clean_one::<Exporter>(
-                xmp,
-                xmp_file,
-                source,
-                target,
-                fs,
-                previously_exported,
-            )
-            .await
+            match xmps.cached_or_parse_from(&xmp_file, fs).await {
+                Ok(xmp) => {
+                    create_update_or_clean_one::<Exporter>(
+                        xmp,
+                        xmp_file,
+                        source,
+                        target,
+                        fs,
+                        previously_exported,
+                    )
+                    .await
+                }
+                Err(e @ XmpError::IncompleteFile) => {
+                    warn!("Error checking what to do with file: {e}");
+                    Ok(Change::None)
+                }
+                Err(other) => Err(other).wrap_err("Could not get xmp"),
+            }
         })
         .collect::<FuturesUnordered<_>>()
         .try_collect()

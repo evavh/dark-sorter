@@ -5,6 +5,7 @@ use std::io::ErrorKind;
 use std::num::ParseIntError;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
@@ -94,10 +95,20 @@ pub struct Xmp {
 
 impl Xmp {
     pub async fn read_from_file(path: &XmpFile, fs: &ThrottledFs) -> Result<Self, XmpError> {
-        let s = fs
-            .read_to_string(path)
-            .await
-            .map_err(|e| XmpError::from_io(e, path))?;
+        let start = Instant::now();
+        let s = loop {
+            let s = fs
+                .read_to_string(path)
+                .await
+                .map_err(|e| XmpError::from_io(e, path))?;
+            if s.trim_end().ends_with("</x:xmpmeta>") {
+                break s;
+            } else if start.elapsed().as_secs() > 0 {
+                return Err(XmpError::IncompleteFile);
+            } else {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
 
         let rating = Rating::from_str(&s)?;
         let edits = edits::parse_edits(&s)
@@ -165,6 +176,8 @@ pub enum XmpError {
     RawWithoutExtension,
     #[error("Could not parse the list of edits")]
     ParseEdits(Arc<miette::Report>),
+    #[error("Missing xmp end, file corrupted or server overloaded while writing")]
+    IncompleteFile,
 }
 
 impl XmpError {
